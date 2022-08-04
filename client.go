@@ -1,6 +1,7 @@
 package geerpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call represents an active RPC.
@@ -20,6 +22,14 @@ type Call struct {
 	Error         error       // if error occurs, it will be set
 	Done          chan *Call  // Strobes when call is complete.
 }
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+// 定义一个函数类型，可作为参数传递
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
 func (call *Call) done() {
 	call.Done <- call
@@ -173,8 +183,16 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 
 // Call invokes the named function, waits for it to complete,
 // and returns its error status.
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+
+	}
 	return call.Error
 }
 
@@ -222,7 +240,7 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 }
 
 // Dial connects to an RPC server at the specified network address
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+/*func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
@@ -238,4 +256,43 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 		}
 	}()
 	return NewClient(conn, opt)
+}*/
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	// close the connection if client is nil
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+	ch := make(chan clientResult)
+
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+// Dial 包装Dail
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	// dialTimeout第一个形参是定义的方法类型，因此传入一个符合定义方法的签名的方法即可
+	return dialTimeout(NewClient, network, address, opts...)
 }
